@@ -57,11 +57,6 @@ using AutoCloudUtil::ReadU32;
 using AutoCloudUtil::ToLowerAscii;
 using AutoCloudUtil::WildcardMatchInsensitive;
 
-// SteamID64 directories in compatdata are named by account ID as a 17-digit
-// decimal number. All SteamID64s for public individual accounts start with
-// "7656" (universe=1, type=1 in the SteamID bitfield).
-static constexpr const char* kSteamId64Prefix = "7656";
-
 // Steam library path discovery
 
 static std::vector<std::filesystem::path> GetSteamLibraryPaths(const std::string& steamPath) {
@@ -917,7 +912,7 @@ ScanResult GetFileList(const std::string& steamPath,
     };
 
     std::unordered_map<std::string, std::string> seenRootsByCloudPath;
-    // Sibling dedupe; separate from primary so siblings can't trip the abort.
+    // Native sibling-expansion dedupe (rule.siblings probe files).
     std::unordered_set<std::string> emittedSiblings;
 
     bool hasRootCollision = false;
@@ -1019,44 +1014,6 @@ ScanResult GetFileList(const std::string& steamPath,
             rule.pattern.c_str(), rule.recursive ? 1 : 0, scanRootUtf8.c_str());
 
 
-        // Some UE games (e.g. Clair Obscur: Expedition 33, Cronos) resolve their save
-        // dir from a fixed placeholder SteamID instead of the logged-in account, so the
-        // real save files sit in a sibling 7656... directory while the token-expanded
-        // root stays empty. Scan every sibling SteamID directory too, each namespaced
-        // under its own ID in the cloud path.
-        std::vector<std::pair<std::filesystem::path, std::string>> scanTargets;
-        scanTargets.emplace_back(scanRoot, normalizedCloudPath);
-        {
-            auto isSteamIdDir = [](const std::string& s) {
-                if (s.size() != 17 || s.rfind(kSteamId64Prefix, 0) != 0) return false;
-                return std::all_of(s.begin(), s.end(),
-                                   [](unsigned char c) { return std::isdigit(c) != 0; });
-            };
-            std::string scanRootLeaf = FileUtil::PathToUtf8(scanRoot.filename());
-            if (isSteamIdDir(scanRootLeaf)) {
-                std::filesystem::path idParent = scanRoot.parent_path();
-                std::error_code ped;
-                std::filesystem::directory_iterator pit(
-                    idParent, std::filesystem::directory_options::skip_permission_denied, ped);
-                std::filesystem::directory_iterator pend;
-                for (; !ped && pit != pend; pit.increment(ped)) {
-                    std::string sibLeaf = FileUtil::PathToUtf8(pit->path().filename());
-                    if (sibLeaf == scanRootLeaf || !isSteamIdDir(sibLeaf)) continue;
-                    std::error_code sed;
-                    if (!pit->is_directory(sed) || sed) continue;
-                    std::string sibCloudPath = normalizedCloudPath;
-                    size_t pos = sibCloudPath.rfind(scanRootLeaf);
-                    if (pos != std::string::npos) {
-                        sibCloudPath = sibCloudPath.substr(0, pos) + sibLeaf +
-                                       sibCloudPath.substr(pos + scanRootLeaf.size());
-                    }
-                    LOG("GetAutoCloudFileList: app %u adding sibling SteamID dir '%s' to scan",
-                        appId, sibLeaf.c_str());
-                    scanTargets.emplace_back(pit->path(), sibCloudPath);
-                }
-            }
-        }
-
         auto considerFile = [&](const std::filesystem::directory_entry& entry,
                                 const std::string& rootPrefix,
                                 const std::string& cloudPrefix) {
@@ -1141,36 +1098,34 @@ ScanResult GetFileList(const std::string& steamPath,
             }
         };
 
-        for (const auto& target : scanTargets) {
-            if (scanLimitReached() || hasRootCollision) break;
-            std::string targetUtf8 = FileUtil::PathToUtf8(target.first);
-            std::string targetPrefix = FileUtil::MakePathPrefix(targetUtf8);
+        {
+            std::string targetPrefix = FileUtil::MakePathPrefix(scanRootUtf8);
             if (rule.recursive) {
                 std::error_code iterEc;
                 std::filesystem::recursive_directory_iterator it(
-                    target.first, std::filesystem::directory_options::skip_permission_denied, iterEc);
+                    scanRoot, std::filesystem::directory_options::skip_permission_denied, iterEc);
                 std::filesystem::recursive_directory_iterator end;
                 for (; !iterEc && it != end; it.increment(iterEc)) {
                     if (scanLimitReached() || hasRootCollision) break;
-                    considerFile(*it, targetPrefix, target.second);
+                    considerFile(*it, targetPrefix, normalizedCloudPath);
                 }
                 if (iterEc) {
                     LOG("GetAutoCloudFileList: directory iteration error in %s: %s",
-                        FileUtil::PathToUtf8(target.first).c_str(), iterEc.message().c_str());
+                        scanRootUtf8.c_str(), iterEc.message().c_str());
                     scanLimitHit = true;
                 }
             } else {
                 std::error_code iterEc;
                 std::filesystem::directory_iterator it(
-                    target.first, std::filesystem::directory_options::skip_permission_denied, iterEc);
+                    scanRoot, std::filesystem::directory_options::skip_permission_denied, iterEc);
                 std::filesystem::directory_iterator end;
                 for (; !iterEc && it != end; it.increment(iterEc)) {
                     if (scanLimitReached() || hasRootCollision) break;
-                    considerFile(*it, targetPrefix, target.second);
+                    considerFile(*it, targetPrefix, normalizedCloudPath);
                 }
                 if (iterEc) {
                     LOG("GetAutoCloudFileList: directory iteration error in %s: %s",
-                        FileUtil::PathToUtf8(target.first).c_str(), iterEc.message().c_str());
+                        scanRootUtf8.c_str(), iterEc.message().c_str());
                     scanLimitHit = true;
                 }
             }
